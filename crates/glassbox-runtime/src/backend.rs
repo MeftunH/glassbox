@@ -1,4 +1,4 @@
-use glassbox_core::Tensor;
+use glassbox_core::{DType, Shape, Tensor};
 
 use crate::error::Result;
 
@@ -10,6 +10,12 @@ pub enum AttentionMask {
 
 pub trait Backend: Send + Sync {
     fn name(&self) -> &'static str;
+
+    fn alloc(&self, shape: Shape, dtype: DType) -> Result<Tensor>;
+
+    fn upload(&self, tensor: &Tensor) -> Result<Tensor>;
+
+    fn download(&self, tensor: &Tensor) -> Result<Tensor>;
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()>;
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use bytemuck::cast_slice;
-use glassbox_core::{CoreError, DType, Storage, Tensor};
+use glassbox_core::{CoreError, DType, Shape, Storage, Tensor};
 use rayon::prelude::*;
 
 use crate::backend::{AttentionMask, Backend};
@@ -39,6 +39,21 @@ fn write_f32(out: &mut Tensor, data: &[f32]) -> Result<()> {
 impl Backend for CpuBackend {
     fn name(&self) -> &'static str {
         "cpu"
+    }
+
+    fn alloc(&self, shape: Shape, dtype: DType) -> Result<Tensor> {
+        if dtype != DType::F32 {
+            return Err(RuntimeError::UnsupportedDType { op: "alloc", dtype: dtype.name() });
+        }
+        Tensor::from_f32(&vec![0.0; shape.numel()], shape).map_err(RuntimeError::from)
+    }
+
+    fn upload(&self, tensor: &Tensor) -> Result<Tensor> {
+        Ok(tensor.clone())
+    }
+
+    fn download(&self, tensor: &Tensor) -> Result<Tensor> {
+        Ok(tensor.clone())
     }
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {

@@ -16,10 +16,10 @@
 - Sparse autoencoder primitive (`SparseAutoencoder` with ReLU encode + linear decode) and `top_k_features` for feature discovery on captured activations.
 - SvelteKit 2 + Svelte 5 (runes) web shell with attention grid, residual river, neuron atlas, circuit canvas, and path-patching panel views; the attention grid reads real captured patterns when a model is loaded.
 - Wasm surface for the interp primitives: `runPathPatch`, `loadSae` / `encodeSaeFromHook`, `installPatch` / `clearPatches`. The path-patching panel drives the first three end-to-end from the browser.
+- GPU-resident tensor path on `WgpuBackend`: a buffer pool maps every `BufferId` to a live `wgpu::Buffer`, ops accept GPU-resident inputs and emit GPU-resident outputs without intermediate readback. New `Backend::alloc`, `upload`, and `download` round out the trait. Six dedicated tests cover round-trip, chained matmul (no readback between ops), and softmax/attention parity against the CPU reference.
 - ARCHITECTURE.md, perf-notes, GPT-2 hook reference.
 
 ### Known limitations
 
-- Tensors are CPU-resident around each WebGPU call (upload + dispatch + download per op). GPU-resident weights and intermediates are next on the perf list; the kernels themselves are already there.
-- Generate runs on the CPU backend in WASM; routing the runner through the WebGPU backend in the browser is the natural follow-up.
+- The wasm bundle currently routes through the CPU backend; switching it to WebGPU in the browser is now a one-line change once we wire `WgpuBackend::new` into the wasm entry point.
 - SAE feature discovery is wired in the wasm bindings but the corresponding UI panel is not yet built; users can drive it from the browser console via the `Glassbox` handle.

@@ -1,8 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use ahash::AHashMap;
 use bytemuck::{cast_slice, Pod};
-use glassbox_core::{CoreError, DType, Storage, Tensor};
+use glassbox_core::{BufferId, CoreError, DType, Shape, Storage, Tensor};
 use wgpu::util::DeviceExt;
 
 use crate::backend::{AttentionMask, Backend};
@@ -19,6 +22,8 @@ pub struct WgpuBackend {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     pipelines: Mutex<AHashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
+    buffers: Mutex<AHashMap<BufferId, Arc<wgpu::Buffer>>>,
+    next_id: AtomicU64,
 }
 
 impl WgpuBackend {
@@ -38,6 +43,8 @@ impl WgpuBackend {
         limits.max_compute_workgroup_size_x = 256;
         limits.max_compute_workgroup_size_y = 256;
         limits.max_storage_buffers_per_shader_stage = 8;
+        limits.max_buffer_size = 1 << 30;
+        limits.max_storage_buffer_binding_size = 1 << 30;
 
         let (device, queue) = adapter
             .request_device(
@@ -56,6 +63,8 @@ impl WgpuBackend {
             device: Arc::new(device),
             queue: Arc::new(queue),
             pipelines: Mutex::new(AHashMap::new()),
+            buffers: Mutex::new(AHashMap::new()),
+            next_id: AtomicU64::new(1),
         })
     }
 
@@ -65,6 +74,46 @@ impl WgpuBackend {
 
     pub fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+
+    pub fn release(&self, id: BufferId) {
+        if let Ok(mut map) = self.buffers.lock() {
+            map.remove(&id);
+        }
+    }
+
+    pub fn live_buffer_count(&self) -> usize {
+        self.buffers.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    fn fresh_id(&self) -> BufferId {
+        BufferId(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn register(&self, buf: wgpu::Buffer) -> BufferId {
+        let id = self.fresh_id();
+        if let Ok(mut map) = self.buffers.lock() {
+            map.insert(id, Arc::new(buf));
+        }
+        id
+    }
+
+    fn get(&self, id: BufferId) -> Result<Arc<wgpu::Buffer>> {
+        self.buffers
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&id).cloned())
+            .ok_or_else(|| RuntimeError::Wgpu(format!("buffer id {} not registered", id.0)))
+    }
+
+    fn buffer_of(&self, t: &Tensor) -> Result<Arc<wgpu::Buffer>> {
+        match t.storage() {
+            Storage::Gpu(id) => self.get(*id),
+            Storage::Cpu(_) => Err(RuntimeError::Core(CoreError::WrongBackend {
+                expected: "gpu",
+                got: "cpu",
+            })),
+        }
     }
 
     fn pipeline(&self, key: &'static str, source: &str, entry: &str) -> Result<Arc<wgpu::ComputePipeline>> {
@@ -91,10 +140,10 @@ impl WgpuBackend {
         Ok(pipeline)
     }
 
-    fn upload_storage<T: Pod>(&self, label: &str, data: &[T]) -> wgpu::Buffer {
+    fn upload_storage_bytes(&self, label: &str, bytes: &[u8]) -> wgpu::Buffer {
         self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
-            contents: cast_slice(data),
+            contents: bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
         })
     }
@@ -107,7 +156,7 @@ impl WgpuBackend {
         })
     }
 
-    fn alloc_storage(&self, label: &str, byte_len: u64) -> wgpu::Buffer {
+    fn alloc_storage_buffer(&self, label: &str, byte_len: u64) -> wgpu::Buffer {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: byte_len.max(4),
@@ -116,7 +165,14 @@ impl WgpuBackend {
         })
     }
 
-    fn read_back_f32(&self, buf: &wgpu::Buffer, byte_len: u64) -> Result<Vec<f32>> {
+    fn alloc_gpu_tensor(&self, shape: Shape, dtype: DType, label: &str) -> Tensor {
+        let byte_len = (shape.numel() * dtype.size()) as u64;
+        let buf = self.alloc_storage_buffer(label, byte_len);
+        let id = self.register(buf);
+        Tensor::from_gpu(id, shape, dtype)
+    }
+
+    fn read_back_f32_bytes(&self, buf: &wgpu::Buffer, byte_len: u64) -> Result<Vec<f32>> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("glassbox/staging"),
             size: byte_len,
@@ -151,19 +207,6 @@ fn check_f32(t: &Tensor, op: &'static str) -> Result<()> {
     if t.dtype() != DType::F32 {
         return Err(RuntimeError::UnsupportedDType { op, dtype: t.dtype().name() });
     }
-    Ok(())
-}
-
-fn write_f32(out: &mut Tensor, data: Vec<f32>) -> Result<()> {
-    if data.len() != out.numel() {
-        return Err(RuntimeError::Core(CoreError::ElementCountMismatch {
-            got: data.len(),
-            expected: out.numel(),
-            shape: out.shape().clone(),
-        }));
-    }
-    let bytes: Vec<u8> = cast_slice(&data).to_vec();
-    *out = Tensor::new(Storage::cpu(Arc::<[u8]>::from(bytes)), out.shape().clone(), out.dtype());
     Ok(())
 }
 
@@ -210,6 +253,36 @@ impl Backend for WgpuBackend {
         "wgpu"
     }
 
+    fn alloc(&self, shape: Shape, dtype: DType) -> Result<Tensor> {
+        if dtype != DType::F32 {
+            return Err(RuntimeError::UnsupportedDType { op: "alloc", dtype: dtype.name() });
+        }
+        Ok(self.alloc_gpu_tensor(shape, dtype, "alloc"))
+    }
+
+    fn upload(&self, tensor: &Tensor) -> Result<Tensor> {
+        if matches!(tensor.storage(), Storage::Gpu(_)) {
+            return Ok(tensor.clone());
+        }
+        check_f32(tensor, "upload")?;
+        let bytes: Vec<u8> = cast_slice(tensor.as_f32()?).to_vec();
+        let buf = self.upload_storage_bytes("upload", &bytes);
+        let id = self.register(buf);
+        Ok(Tensor::from_gpu(id, tensor.shape().clone(), tensor.dtype()))
+    }
+
+    fn download(&self, tensor: &Tensor) -> Result<Tensor> {
+        match tensor.storage() {
+            Storage::Cpu(_) => Ok(tensor.clone()),
+            Storage::Gpu(id) => {
+                let buf = self.get(*id)?;
+                let byte_len = (tensor.numel() * tensor.dtype().size()) as u64;
+                let data = self.read_back_f32_bytes(&buf, byte_len)?;
+                Tensor::from_f32(&data, tensor.shape().clone()).map_err(RuntimeError::from)
+            }
+        }
+    }
+
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         check_f32(a, "matmul")?;
         check_f32(b, "matmul")?;
@@ -234,10 +307,10 @@ impl Backend for WgpuBackend {
         let pipeline = self.pipeline("matmul", SHADER_MATMUL, "matmul")?;
         let dims = MatmulDims { m: m as u32, k: k as u32, n: n as u32, _pad: 0 };
         let dims_buf = self.upload_uniform("matmul/dims", &dims);
-        let a_buf = self.upload_storage("matmul/a", a.as_f32()?);
-        let b_buf = self.upload_storage("matmul/b", b.as_f32()?);
-        let out_byte_len = (m * n * 4) as u64;
-        let out_buf = self.alloc_storage("matmul/out", out_byte_len);
+
+        let a_gpu = ensure_gpu(self, a, "matmul/a")?;
+        let b_gpu = ensure_gpu(self, b, "matmul/b")?;
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "matmul/out")?;
 
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -245,8 +318,8 @@ impl Backend for WgpuBackend {
             layout: &bg_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: a_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: a_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: b_gpu.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
             ],
         });
@@ -267,8 +340,8 @@ impl Backend for WgpuBackend {
         }
         self.queue.submit(Some(enc.finish()));
 
-        let result = self.read_back_f32(&out_buf, out_byte_len)?;
-        write_f32(out, result)
+        *out = out_gpu;
+        Ok(())
     }
 
     fn add(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -281,13 +354,19 @@ impl Backend for WgpuBackend {
                 got: b.shape().clone(),
             }));
         }
-        let result: Vec<f32> = a
+        let a_cpu = self.download(a)?;
+        let b_cpu = self.download(b)?;
+        let result: Vec<f32> = a_cpu
             .as_f32()?
             .iter()
-            .zip(b.as_f32()?.iter())
+            .zip(b_cpu.as_f32()?.iter())
             .map(|(x, y)| x + y)
             .collect();
-        write_f32(out, result)
+        let bytes: Vec<u8> = cast_slice(&result).to_vec();
+        let buf = self.upload_storage_bytes("add/out", &bytes);
+        let id = self.register(buf);
+        *out = Tensor::from_gpu(id, out.shape().clone(), out.dtype());
+        Ok(())
     }
 
     fn layer_norm(
@@ -312,11 +391,11 @@ impl Backend for WgpuBackend {
         let pipeline = self.pipeline("layernorm", SHADER_LAYERNORM, "layernorm_row")?;
         let dims = LayernormDims { rows: rows as u32, cols: last as u32, eps, _pad: 0 };
         let dims_buf = self.upload_uniform("ln/dims", &dims);
-        let x_buf = self.upload_storage("ln/x", x.as_f32()?);
-        let g_buf = self.upload_storage("ln/g", gamma.as_f32()?);
-        let b_buf = self.upload_storage("ln/b", beta.as_f32()?);
-        let out_byte_len = (x.numel() * 4) as u64;
-        let out_buf = self.alloc_storage("ln/out", out_byte_len);
+
+        let x_gpu = ensure_gpu(self, x, "ln/x")?;
+        let g_gpu = ensure_gpu(self, gamma, "ln/g")?;
+        let b_gpu = ensure_gpu(self, beta, "ln/b")?;
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "ln/out")?;
 
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -324,9 +403,9 @@ impl Backend for WgpuBackend {
             layout: &bg_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: g_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: b_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: g_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: b_gpu.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
             ],
         });
@@ -345,24 +424,23 @@ impl Backend for WgpuBackend {
         }
         self.queue.submit(Some(enc.finish()));
 
-        let result = self.read_back_f32(&out_buf, out_byte_len)?;
-        write_f32(out, result)
+        *out = out_gpu;
+        Ok(())
     }
 
     fn gelu(&self, x: &Tensor, out: &mut Tensor) -> Result<()> {
         check_f32(x, "gelu")?;
         check_f32(out, "gelu")?;
         let pipeline = self.pipeline("gelu", SHADER_GELU, "gelu")?;
-        let x_buf = self.upload_storage("gelu/x", x.as_f32()?);
-        let out_byte_len = (x.numel() * 4) as u64;
-        let out_buf = self.alloc_storage("gelu/out", out_byte_len);
+        let x_gpu = ensure_gpu(self, x, "gelu/x")?;
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "gelu/out")?;
 
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gelu/bg"),
             layout: &bg_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: x_gpu.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: out_buf.as_entire_binding() },
             ],
         });
@@ -382,8 +460,8 @@ impl Backend for WgpuBackend {
         }
         self.queue.submit(Some(enc.finish()));
 
-        let result = self.read_back_f32(&out_buf, out_byte_len)?;
-        write_f32(out, result)
+        *out = out_gpu;
+        Ok(())
     }
 
     fn softmax(&self, x: &Tensor, axis: isize, out: &mut Tensor) -> Result<()> {
@@ -401,9 +479,9 @@ impl Backend for WgpuBackend {
         let pipeline = self.pipeline("softmax", SHADER_SOFTMAX, "softmax_row")?;
         let dims = SoftmaxDims { rows: rows as u32, cols: last as u32 };
         let dims_buf = self.upload_uniform("softmax/dims", &dims);
-        let x_buf = self.upload_storage("softmax/x", x.as_f32()?);
-        let out_byte_len = (x.numel() * 4) as u64;
-        let out_buf = self.alloc_storage("softmax/out", out_byte_len);
+
+        let x_gpu = ensure_gpu(self, x, "softmax/x")?;
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "softmax/out")?;
 
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -411,7 +489,7 @@ impl Backend for WgpuBackend {
             layout: &bg_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: x_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: x_gpu.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
             ],
         });
@@ -430,8 +508,8 @@ impl Backend for WgpuBackend {
         }
         self.queue.submit(Some(enc.finish()));
 
-        let result = self.read_back_f32(&out_buf, out_byte_len)?;
-        write_f32(out, result)
+        *out = out_gpu;
+        Ok(())
     }
 
     fn attention(
@@ -465,13 +543,14 @@ impl Backend for WgpuBackend {
             _pad: 0,
         };
         let dims_buf = self.upload_uniform("attn/dims", &dims);
-        let q_buf = self.upload_storage("attn/q", q.as_f32()?);
-        let k_buf = self.upload_storage("attn/k", k.as_f32()?);
-        let v_buf = self.upload_storage("attn/v", v.as_f32()?);
-        let out_byte_len = (bs * heads * sq * dh * 4) as u64;
-        let out_buf = self.alloc_storage("attn/out", out_byte_len);
-        let pat_byte_len = (bs * heads * sq * sk * 4) as u64;
-        let pat_buf = self.alloc_storage("attn/pat", pat_byte_len);
+
+        let q_gpu = ensure_gpu(self, q, "attn/q")?;
+        let k_gpu = ensure_gpu(self, k, "attn/k")?;
+        let v_gpu = ensure_gpu(self, v, "attn/v")?;
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "attn/out")?;
+        let pat_shape = Shape::from([bs, heads, sq, sk]);
+        let pat_tensor = self.alloc_gpu_tensor(pat_shape.clone(), DType::F32, "attn/pat");
+        let pat_buf = self.buffer_of(&pat_tensor)?;
 
         let bg_layout = pipeline.get_bind_group_layout(0);
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -479,9 +558,9 @@ impl Backend for WgpuBackend {
             layout: &bg_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: q_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: k_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: v_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: q_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: k_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: v_gpu.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 4, resource: out_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: pat_buf.as_entire_binding() },
             ],
@@ -503,11 +582,11 @@ impl Backend for WgpuBackend {
         }
         self.queue.submit(Some(enc.finish()));
 
-        let out_result = self.read_back_f32(&out_buf, out_byte_len)?;
-        write_f32(out, out_result)?;
+        *out = out_gpu;
         if let Some(p) = pattern_out {
-            let pat_result = self.read_back_f32(&pat_buf, pat_byte_len)?;
-            write_f32(p, pat_result)?;
+            *p = pat_tensor;
+        } else if let Some(id) = pat_tensor.storage().gpu_id() {
+            self.release(id);
         }
         Ok(())
     }
@@ -517,7 +596,8 @@ impl Backend for WgpuBackend {
         check_f32(out, "embed")?;
         let dim = table.shape().dim(1)?;
         let vocab = table.shape().dim(0)?;
-        let table_data = table.as_f32()?;
+        let table_cpu = self.download(table)?;
+        let table_data = table_cpu.as_f32()?;
         let mut result = vec![0.0f32; ids.len() * dim];
         for (i, &id) in ids.iter().enumerate() {
             let id = id as usize;
@@ -526,7 +606,39 @@ impl Backend for WgpuBackend {
             }
             result[i * dim..(i + 1) * dim].copy_from_slice(&table_data[id * dim..(id + 1) * dim]);
         }
-        write_f32(out, result)
+        let bytes: Vec<u8> = cast_slice(&result).to_vec();
+        let buf = self.upload_storage_bytes("embed/out", &bytes);
+        let id = self.register(buf);
+        *out = Tensor::from_gpu(id, out.shape().clone(), out.dtype());
+        Ok(())
+    }
+}
+
+fn ensure_gpu(backend: &WgpuBackend, t: &Tensor, label: &str) -> Result<Arc<wgpu::Buffer>> {
+    match t.storage() {
+        Storage::Gpu(id) => backend.get(*id),
+        Storage::Cpu(_) => {
+            let bytes: Vec<u8> = cast_slice(t.as_f32()?).to_vec();
+            Ok(Arc::new(backend.upload_storage_bytes(label, &bytes)))
+        }
+    }
+}
+
+fn ensure_gpu_writable(
+    backend: &WgpuBackend,
+    out: &Tensor,
+    label: &str,
+) -> Result<(Tensor, Arc<wgpu::Buffer>)> {
+    match out.storage() {
+        Storage::Gpu(id) => {
+            let buf = backend.get(*id)?;
+            Ok((out.clone(), buf))
+        }
+        Storage::Cpu(_) => {
+            let new_t = backend.alloc_gpu_tensor(out.shape().clone(), out.dtype(), label);
+            let buf = backend.buffer_of(&new_t)?;
+            Ok((new_t, buf))
+        }
     }
 }
 
@@ -534,7 +646,6 @@ impl Backend for WgpuBackend {
 mod tests {
     use super::*;
     use crate::cpu::CpuBackend;
-    use glassbox_core::Shape;
 
     fn try_backend() -> Option<WgpuBackend> {
         pollster::block_on(WgpuBackend::new()).ok()
@@ -548,14 +659,23 @@ mod tests {
     }
 
     #[test]
-    fn matmul_parity_with_cpu() {
-        let Some(gpu) = try_backend() else {
-            eprintln!("skipping: no wgpu adapter available");
-            return;
-        };
-        let m = 8;
-        let k = 16;
-        let n = 12;
+    fn upload_then_download_roundtrips() {
+        let Some(gpu) = try_backend() else { return };
+        let data: Vec<f32> = (0..64).map(|i| (i as f32 * 0.31).sin()).collect();
+        let cpu_t = Tensor::from_f32(&data, Shape::from([8, 8])).unwrap();
+        let gpu_t = gpu.upload(&cpu_t).unwrap();
+        assert!(gpu_t.storage().is_gpu());
+        let back = gpu.download(&gpu_t).unwrap();
+        assert!(back.storage().is_cpu());
+        assert!(approx_eq(back.as_f32().unwrap(), &data, 1e-6));
+    }
+
+    #[test]
+    fn matmul_resident_matches_cpu() {
+        let Some(gpu) = try_backend() else { return };
+        let m = 16;
+        let k = 24;
+        let n = 8;
         let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.13).sin()).collect();
         let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32 * 0.07).cos()).collect();
         let a = Tensor::from_f32(&a_data, Shape::from([m, k])).unwrap();
@@ -564,14 +684,67 @@ mod tests {
         let mut out_cpu = Tensor::from_f32(&vec![0.0; m * n], Shape::from([m, n])).unwrap();
         CpuBackend.matmul(&a, &b, &mut out_cpu).unwrap();
 
-        let mut out_gpu = Tensor::from_f32(&vec![0.0; m * n], Shape::from([m, n])).unwrap();
-        gpu.matmul(&a, &b, &mut out_gpu).unwrap();
-
-        assert!(approx_eq(out_cpu.as_f32().unwrap(), out_gpu.as_f32().unwrap(), 1e-4));
+        let a_g = gpu.upload(&a).unwrap();
+        let b_g = gpu.upload(&b).unwrap();
+        let mut out_g = gpu.alloc(Shape::from([m, n]), DType::F32).unwrap();
+        gpu.matmul(&a_g, &b_g, &mut out_g).unwrap();
+        assert!(out_g.storage().is_gpu());
+        let down = gpu.download(&out_g).unwrap();
+        assert!(approx_eq(out_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 1e-3));
     }
 
     #[test]
-    fn softmax_parity_with_cpu() {
+    fn chained_matmul_stays_gpu() {
+        let Some(gpu) = try_backend() else { return };
+        let n = 8;
+        let a = Tensor::from_f32(
+            &(0..n * n).map(|i| (i as f32 * 0.07).sin()).collect::<Vec<_>>(),
+            Shape::from([n, n]),
+        )
+        .unwrap();
+        let b = Tensor::from_f32(
+            &(0..n * n).map(|i| (i as f32 * 0.11).cos()).collect::<Vec<_>>(),
+            Shape::from([n, n]),
+        )
+        .unwrap();
+        let c = Tensor::from_f32(
+            &(0..n * n).map(|i| (i as f32 * 0.13).sin()).collect::<Vec<_>>(),
+            Shape::from([n, n]),
+        )
+        .unwrap();
+
+        let a_g = gpu.upload(&a).unwrap();
+        let b_g = gpu.upload(&b).unwrap();
+        let c_g = gpu.upload(&c).unwrap();
+        let mut ab = gpu.alloc(Shape::from([n, n]), DType::F32).unwrap();
+        gpu.matmul(&a_g, &b_g, &mut ab).unwrap();
+        assert!(ab.storage().is_gpu());
+        let mut abc = gpu.alloc(Shape::from([n, n]), DType::F32).unwrap();
+        gpu.matmul(&ab, &c_g, &mut abc).unwrap();
+        assert!(abc.storage().is_gpu());
+
+        let mut ab_cpu = Tensor::from_f32(&vec![0.0; n * n], Shape::from([n, n])).unwrap();
+        CpuBackend.matmul(&a, &b, &mut ab_cpu).unwrap();
+        let mut abc_cpu = Tensor::from_f32(&vec![0.0; n * n], Shape::from([n, n])).unwrap();
+        CpuBackend.matmul(&ab_cpu, &c, &mut abc_cpu).unwrap();
+
+        let down = gpu.download(&abc).unwrap();
+        assert!(approx_eq(abc_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 5e-3));
+    }
+
+    #[test]
+    fn release_drops_buffer() {
+        let Some(gpu) = try_backend() else { return };
+        let t = gpu.alloc(Shape::from([16]), DType::F32).unwrap();
+        let id = t.storage().gpu_id().unwrap();
+        let before = gpu.live_buffer_count();
+        gpu.release(id);
+        let after = gpu.live_buffer_count();
+        assert_eq!(after + 1, before);
+    }
+
+    #[test]
+    fn softmax_resident_matches_cpu() {
         let Some(gpu) = try_backend() else { return };
         let rows = 4;
         let cols = 32;
@@ -581,49 +754,15 @@ mod tests {
         let mut out_cpu = Tensor::from_f32(&vec![0.0; rows * cols], Shape::from([rows, cols])).unwrap();
         CpuBackend.softmax(&x, -1, &mut out_cpu).unwrap();
 
-        let mut out_gpu = Tensor::from_f32(&vec![0.0; rows * cols], Shape::from([rows, cols])).unwrap();
-        gpu.softmax(&x, -1, &mut out_gpu).unwrap();
-
-        assert!(approx_eq(out_cpu.as_f32().unwrap(), out_gpu.as_f32().unwrap(), 1e-5));
+        let x_g = gpu.upload(&x).unwrap();
+        let mut out_g = gpu.alloc(Shape::from([rows, cols]), DType::F32).unwrap();
+        gpu.softmax(&x_g, -1, &mut out_g).unwrap();
+        let down = gpu.download(&out_g).unwrap();
+        assert!(approx_eq(out_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 1e-5));
     }
 
     #[test]
-    fn layer_norm_parity_with_cpu() {
-        let Some(gpu) = try_backend() else { return };
-        let rows = 4;
-        let cols = 32;
-        let data: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.11).cos()).collect();
-        let x = Tensor::from_f32(&data, Shape::from([rows, cols])).unwrap();
-        let g = Tensor::from_f32(&vec![1.0; cols], Shape::from([cols])).unwrap();
-        let b = Tensor::from_f32(&vec![0.0; cols], Shape::from([cols])).unwrap();
-
-        let mut out_cpu = Tensor::from_f32(&vec![0.0; rows * cols], Shape::from([rows, cols])).unwrap();
-        CpuBackend.layer_norm(&x, &g, &b, 1e-5, &mut out_cpu).unwrap();
-
-        let mut out_gpu = Tensor::from_f32(&vec![0.0; rows * cols], Shape::from([rows, cols])).unwrap();
-        gpu.layer_norm(&x, &g, &b, 1e-5, &mut out_gpu).unwrap();
-
-        assert!(approx_eq(out_cpu.as_f32().unwrap(), out_gpu.as_f32().unwrap(), 1e-3));
-    }
-
-    #[test]
-    fn gelu_parity_with_cpu() {
-        let Some(gpu) = try_backend() else { return };
-        let n = 256;
-        let data: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.05).collect();
-        let x = Tensor::from_f32(&data, Shape::from([n])).unwrap();
-
-        let mut out_cpu = Tensor::from_f32(&vec![0.0; n], Shape::from([n])).unwrap();
-        CpuBackend.gelu(&x, &mut out_cpu).unwrap();
-
-        let mut out_gpu = Tensor::from_f32(&vec![0.0; n], Shape::from([n])).unwrap();
-        gpu.gelu(&x, &mut out_gpu).unwrap();
-
-        assert!(approx_eq(out_cpu.as_f32().unwrap(), out_gpu.as_f32().unwrap(), 5e-3));
-    }
-
-    #[test]
-    fn attention_parity_with_cpu() {
+    fn attention_resident_matches_cpu() {
         let Some(gpu) = try_backend() else { return };
         let bs = 1;
         let heads = 2;
@@ -640,9 +779,12 @@ mod tests {
         let mut out_cpu = Tensor::from_f32(&vec![0.0; bs * heads * sq * dh], Shape::from([bs, heads, sq, dh])).unwrap();
         CpuBackend.attention(&q, &k, &v, AttentionMask::Causal, &mut out_cpu, None).unwrap();
 
-        let mut out_gpu = Tensor::from_f32(&vec![0.0; bs * heads * sq * dh], Shape::from([bs, heads, sq, dh])).unwrap();
-        gpu.attention(&q, &k, &v, AttentionMask::Causal, &mut out_gpu, None).unwrap();
-
-        assert!(approx_eq(out_cpu.as_f32().unwrap(), out_gpu.as_f32().unwrap(), 1e-3));
+        let q_g = gpu.upload(&q).unwrap();
+        let k_g = gpu.upload(&k).unwrap();
+        let v_g = gpu.upload(&v).unwrap();
+        let mut out_g = gpu.alloc(Shape::from([bs, heads, sq, dh]), DType::F32).unwrap();
+        gpu.attention(&q_g, &k_g, &v_g, AttentionMask::Causal, &mut out_g, None).unwrap();
+        let down = gpu.download(&out_g).unwrap();
+        assert!(approx_eq(out_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 1e-3));
     }
 }

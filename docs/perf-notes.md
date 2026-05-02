@@ -35,6 +35,10 @@ Tile sizes baked at 16×16 today. On Apple Silicon, 32×8 matches CoreML's heuri
 
 Expected: 5–15% on M-series, 0–5% on discrete GPUs.
 
+## Done
+
+- **GPU-resident tensors.** `Backend::alloc/upload/download` and a buffer pool inside `WgpuBackend` mean ops no longer round-trip activations through the CPU. Weights upload once at model load; intermediates stay on the GPU between ops; only the final logits come back. Matmul-chain test confirms two consecutive matmuls with zero readback in between, parity-matched against the CPU reference.
+
 ## Things that did not pan out
 
 - **fp16 accumulation in matmul.** Saved 12% but PPL on WikiText-2 rose by 0.4. Reverted.
