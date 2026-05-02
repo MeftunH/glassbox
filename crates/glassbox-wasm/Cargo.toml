@@ -14,10 +14,11 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 glassbox-core.workspace = true
-glassbox-runtime.workspace = true
+glassbox-runtime = { workspace = true, features = ["cpu", "wgpu"] }
 glassbox-models.workspace = true
 glassbox-interp.workspace = true
 wasm-bindgen.workspace = true
+wasm-bindgen-futures = "0.4"
 js-sys.workspace = true
 web-sys = { workspace = true, features = ["Window", "Performance", "console"] }
 serde-wasm-bindgen.workspace = true

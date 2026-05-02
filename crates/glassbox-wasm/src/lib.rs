@@ -4,6 +4,8 @@ use glassbox_core::{Shape, Tensor};
 use glassbox_interp::{run_path_patch, top_k_features, PathPatchResult, PathPatchSpec, SparseAutoencoder};
 use glassbox_models::{Bpe, GlxFile, Gpt2, Gpt2Runner};
 use glassbox_runtime::{Backend, CpuBackend, HookRegistry, SamplingConfig, Sampler};
+use glassbox_runtime::wgpu_backend::WgpuBackend;
+use wasm_bindgen_futures::future_to_promise;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -86,13 +88,33 @@ pub struct SaeFeatureSpike {
     pub activation: f32,
 }
 
+enum BackendChoice {
+    Cpu(CpuBackend),
+    Wgpu(WgpuBackend),
+}
+
+impl BackendChoice {
+    fn as_backend(&self) -> &dyn Backend {
+        match self {
+            BackendChoice::Cpu(b) => b,
+            BackendChoice::Wgpu(b) => b,
+        }
+    }
+}
+
+impl std::fmt::Debug for BackendChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BackendChoice({})", self.as_backend().name())
+    }
+}
+
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct Glassbox {
     model: Arc<Gpt2>,
     tokenizer: Bpe,
     hooks: Arc<HookRegistry>,
-    backend: CpuBackend,
+    backend: BackendChoice,
     saes: std::sync::Mutex<ahash::AHashMap<String, SparseAutoencoder>>,
 }
 
@@ -100,21 +122,30 @@ pub struct Glassbox {
 impl Glassbox {
     #[wasm_bindgen(js_name = fromBlob)]
     pub fn from_blob(blob: &[u8]) -> Result<Glassbox, JsValue> {
-        let file = GlxFile::read(blob).map_err(jserr)?;
-        let model = Gpt2::from_glx(&file).map_err(jserr)?;
-        let tokenizer_json = file.header.tokenizer_blob.clone().unwrap_or_default();
-        let tokenizer = Bpe::from_json(&tokenizer_json).unwrap_or_else(|_| {
-            Bpe::from_blob(glassbox_models::tokenizer::BpeBlob {
-                vocab: ahash::AHashMap::new(),
-                merges: Vec::new(),
-            })
-        });
+        let (model, tokenizer) = parse_glx(blob)?;
         Ok(Self {
             model: Arc::new(model),
             tokenizer,
             hooks: HookRegistry::new(),
-            backend: CpuBackend,
+            backend: BackendChoice::Cpu(CpuBackend),
             saes: std::sync::Mutex::new(ahash::AHashMap::new()),
+        })
+    }
+
+    #[wasm_bindgen(js_name = fromBlobWebGpu)]
+    pub fn from_blob_webgpu(blob: js_sys::Uint8Array) -> js_sys::Promise {
+        let bytes = blob.to_vec();
+        future_to_promise(async move {
+            let (model, tokenizer) = parse_glx(&bytes)?;
+            let backend = WgpuBackend::new().await.map_err(jserr)?;
+            let glass = Self {
+                model: Arc::new(model),
+                tokenizer,
+                hooks: HookRegistry::new(),
+                backend: BackendChoice::Wgpu(backend),
+                saes: std::sync::Mutex::new(ahash::AHashMap::new()),
+            };
+            Ok(JsValue::from(glass))
         })
     }
 
@@ -160,7 +191,7 @@ impl Glassbox {
     }
 
     pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, JsValue> {
-        let runner = Gpt2Runner::new(&self.model, &self.backend, Arc::clone(&self.hooks)).map_err(jserr)?;
+        let runner = Gpt2Runner::new(&self.model, self.backend.as_backend(), Arc::clone(&self.hooks)).map_err(jserr)?;
         let logits = runner.forward(ids).map_err(jserr)?;
         runner.last_position_logits(&logits).map_err(jserr)
     }
@@ -169,7 +200,7 @@ impl Glassbox {
         let sampling: SamplingArgs = serde_wasm_bindgen::from_value(args)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         let mut sampler = Sampler::new(sampling.into());
-        let runner = Gpt2Runner::new(&self.model, &self.backend, Arc::clone(&self.hooks)).map_err(jserr)?;
+        let runner = Gpt2Runner::new(&self.model, self.backend.as_backend(), Arc::clone(&self.hooks)).map_err(jserr)?;
 
         let start = now_ms();
         let mut ids: Vec<u32> = self.tokenizer.encode(prompt);
@@ -191,7 +222,7 @@ impl Glassbox {
 
     #[wasm_bindgen(js_name = backendName)]
     pub fn backend_name(&self) -> String {
-        Backend::name(&self.backend).to_string()
+        self.backend.as_backend().name().to_string()
     }
 
     #[wasm_bindgen(js_name = runPathPatch)]
@@ -215,7 +246,7 @@ impl Glassbox {
             target_token: args.target_token,
         };
         let start = now_ms();
-        let result = run_path_patch(&self.model, &self.backend, &spec).map_err(jserr)?;
+        let result = run_path_patch(&self.model, self.backend.as_backend(), &spec).map_err(jserr)?;
         let mut out: PathPatchOut = result.into();
         out.elapsed_ms = now_ms() - start;
         serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
@@ -267,7 +298,7 @@ impl Glassbox {
             )));
         };
 
-        let features = sae.encode(&self.backend, &activation_2d).map_err(jserr)?;
+        let features = sae.encode(self.backend.as_backend(), &activation_2d).map_err(jserr)?;
         let top = top_k_features(&features, top_k).map_err(jserr)?;
         let result: Vec<SaeFeatureSpike> = top
             .into_iter()
@@ -292,6 +323,19 @@ impl Glassbox {
 
 fn jserr(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
+}
+
+fn parse_glx(blob: &[u8]) -> Result<(Gpt2, Bpe), JsValue> {
+    let file = GlxFile::read(blob).map_err(jserr)?;
+    let model = Gpt2::from_glx(&file).map_err(jserr)?;
+    let tokenizer_json = file.header.tokenizer_blob.clone().unwrap_or_default();
+    let tokenizer = Bpe::from_json(&tokenizer_json).unwrap_or_else(|_| {
+        Bpe::from_blob(glassbox_models::tokenizer::BpeBlob {
+            vocab: ahash::AHashMap::new(),
+            merges: Vec::new(),
+        })
+    });
+    Ok((model, tokenizer))
 }
 
 fn now_ms() -> f64 {

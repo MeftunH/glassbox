@@ -74,10 +74,13 @@ export interface LoadProgress {
     bytes_total: number;
 }
 
+export type Backend = 'auto' | 'webgpu' | 'cpu';
+
 export async function loadGlassbox(
     modelUrl: string,
-    onProgress?: (p: LoadProgress) => void
-): Promise<GlassboxHandle> {
+    onProgress?: (p: LoadProgress) => void,
+    backendPref: Backend = 'auto'
+): Promise<{ handle: GlassboxHandle; backend: 'webgpu' | 'cpu' }> {
     onProgress?.({ phase: 'fetching', bytes_loaded: 0, bytes_total: 0 });
 
     const response = await fetch(modelUrl);
@@ -110,10 +113,30 @@ export async function loadGlassbox(
     await wasm.default();
 
     onProgress?.({ phase: 'binding', bytes_loaded: received, bytes_total: total });
-    const handle = wasm.Glassbox.fromBlob(blob);
-    onProgress?.({ phase: 'ready', bytes_loaded: received, bytes_total: total });
 
-    return handle as GlassboxHandle;
+    const tryWebGpu =
+        backendPref !== 'cpu' &&
+        typeof navigator !== 'undefined' &&
+        (navigator as Navigator & { gpu?: unknown }).gpu !== undefined;
+
+    let handle: GlassboxHandle;
+    let backend: 'webgpu' | 'cpu';
+    if (tryWebGpu) {
+        try {
+            handle = (await wasm.Glassbox.fromBlobWebGpu(blob)) as GlassboxHandle;
+            backend = 'webgpu';
+        } catch (e) {
+            if (backendPref === 'webgpu') throw e;
+            handle = wasm.Glassbox.fromBlob(blob) as GlassboxHandle;
+            backend = 'cpu';
+        }
+    } else {
+        handle = wasm.Glassbox.fromBlob(blob) as GlassboxHandle;
+        backend = 'cpu';
+    }
+
+    onProgress?.({ phase: 'ready', bytes_loaded: received, bytes_total: total });
+    return { handle, backend };
 }
 
 export function formatBytes(n: number): string {

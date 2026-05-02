@@ -5,6 +5,7 @@ class SessionStore {
     info = $state<ModelInfo | null>(null);
     progress = $state<LoadProgress | null>(null);
     error = $state<string | null>(null);
+    activeBackend = $state<'webgpu' | 'cpu' | null>(null);
 
     prompt = $state<string>('When the model attends to the previous token,');
     tokens = $state<number[]>([]);

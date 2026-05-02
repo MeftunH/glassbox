@@ -69,10 +69,11 @@
     async function load() {
         try {
             session.error = null;
-            const handle = await loadGlassbox(modelUrl, (p) => {
+            const { handle, backend } = await loadGlassbox(modelUrl, (p) => {
                 session.progress = p;
             });
             session.setHandle(handle);
+            session.activeBackend = backend;
             session.tokens = Array.from(handle.encode(session.prompt));
         } catch (e) {
             session.setError(e instanceof Error ? e.message : String(e));
@@ -137,6 +138,10 @@
             <span class="dim">{formatParams(session.info.parameter_count)} params</span>
             <span class="dim">·</span>
             <span class="dim">{session.info.n_layer}L · {session.info.n_head}H · {session.info.n_embd}d</span>
+            {#if session.activeBackend}
+                <span class="dim">·</span>
+                <span class="tag" class:active={session.activeBackend === 'webgpu'}>{session.activeBackend}</span>
+            {/if}
         {:else}
             <span class="dim">no model loaded</span>
         {/if}
