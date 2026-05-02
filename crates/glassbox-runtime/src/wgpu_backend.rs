@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use glassbox_core::Tensor;
-use wgpu::util::DeviceExt;
 
 use crate::backend::{AttentionMask, Backend};
 use crate::error::{Result, RuntimeError};
@@ -48,7 +47,6 @@ impl WgpuBackend {
         let _ = SHADER_LAYERNORM;
         let _ = SHADER_GELU;
         let _ = SHADER_ATTENTION;
-        let _ = wgpu::util::DeviceExt::create_buffer_init;
 
         Ok(Self { device: Arc::new(device), queue: Arc::new(queue) })
     }

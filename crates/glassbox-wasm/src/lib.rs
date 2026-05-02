@@ -36,6 +36,7 @@ impl From<SamplingArgs> for SamplingConfig {
 }
 
 #[wasm_bindgen]
+#[derive(Debug)]
 pub struct Glassbox {
     model: Arc<Gpt2>,
     tokenizer: Bpe,
