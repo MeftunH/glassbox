@@ -14,6 +14,13 @@ export interface SamplingArgs {
     seed: number;
 }
 
+export interface GenerateOutput {
+    tokens: Uint32Array;
+    text: string;
+    elapsed_ms: number;
+    tokens_per_second: number;
+}
+
 export interface GlassboxHandle {
     modelInfo(): ModelInfo;
     encode(text: string): Uint32Array;
@@ -21,7 +28,9 @@ export interface GlassboxHandle {
     subscribe(hook: string): void;
     unsubscribe(hook: string): void;
     readHook(hook: string): Float32Array | null;
-    sample(logits: Float32Array, args: SamplingArgs): number;
+    clearHooks(): void;
+    forward(ids: Uint32Array): Float32Array;
+    generate(prompt: string, maxNew: number, args: SamplingArgs): GenerateOutput;
     backendName(): string;
 }
 

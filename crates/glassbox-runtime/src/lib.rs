@@ -3,6 +3,7 @@
 pub mod arena;
 pub mod backend;
 pub mod error;
+pub mod hooks;
 pub mod ops;
 pub mod sampling;
 
@@ -14,6 +15,7 @@ pub mod wgpu_backend;
 
 pub use backend::{AttentionMask, Backend};
 pub use error::{Result, RuntimeError};
+pub use hooks::{HookName, HookRegistry};
 pub use sampling::{SamplingConfig, Sampler};
 
 #[cfg(feature = "cpu")]

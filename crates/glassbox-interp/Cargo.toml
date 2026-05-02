@@ -17,3 +17,6 @@ thiserror.workspace = true
 ahash.workspace = true
 tracing.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+glassbox-runtime = { workspace = true, features = ["cpu"] }

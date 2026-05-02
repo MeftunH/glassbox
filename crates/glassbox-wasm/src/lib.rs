@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
-use glassbox_interp::HookRegistry;
-use glassbox_models::{Bpe, GlxFile, Gpt2};
-use glassbox_runtime::{Backend, CpuBackend, SamplingConfig, Sampler};
+use glassbox_models::{Bpe, GlxFile, Gpt2, Gpt2Runner};
+use glassbox_runtime::{Backend, CpuBackend, HookRegistry, SamplingConfig, Sampler};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
@@ -35,6 +34,14 @@ impl From<SamplingArgs> for SamplingConfig {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateOutput {
+    pub tokens: Vec<u32>,
+    pub text: String,
+    pub elapsed_ms: f64,
+    pub tokens_per_second: f64,
+}
+
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct Glassbox {
@@ -51,11 +58,12 @@ impl Glassbox {
         let file = GlxFile::read(blob).map_err(jserr)?;
         let model = Gpt2::from_glx(&file).map_err(jserr)?;
         let tokenizer_json = file.header.tokenizer_blob.clone().unwrap_or_default();
-        let tokenizer = Bpe::from_json(&tokenizer_json)
-            .unwrap_or_else(|_| Bpe::from_blob(glassbox_models::tokenizer::BpeBlob {
+        let tokenizer = Bpe::from_json(&tokenizer_json).unwrap_or_else(|_| {
+            Bpe::from_blob(glassbox_models::tokenizer::BpeBlob {
                 vocab: ahash::AHashMap::new(),
                 merges: Vec::new(),
-            }));
+            })
+        });
         Ok(Self {
             model: Arc::new(model),
             tokenizer,
@@ -100,11 +108,39 @@ impl Glassbox {
         t.as_f32().ok().map(<[f32]>::to_vec)
     }
 
-    pub fn sample(&self, logits: &[f32], args: JsValue) -> Result<u32, JsValue> {
-        let args: SamplingArgs = serde_wasm_bindgen::from_value(args)
+    #[wasm_bindgen(js_name = clearHooks)]
+    pub fn clear_hooks(&self) {
+        self.hooks.clear();
+    }
+
+    pub fn forward(&self, ids: &[u32]) -> Result<Vec<f32>, JsValue> {
+        let runner = Gpt2Runner::new(&self.model, &self.backend, Arc::clone(&self.hooks)).map_err(jserr)?;
+        let logits = runner.forward(ids).map_err(jserr)?;
+        runner.last_position_logits(&logits).map_err(jserr)
+    }
+
+    pub fn generate(&self, prompt: &str, max_new: u32, args: JsValue) -> Result<JsValue, JsValue> {
+        let sampling: SamplingArgs = serde_wasm_bindgen::from_value(args)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let mut sampler = Sampler::new(args.into());
-        Ok(sampler.sample(logits))
+        let mut sampler = Sampler::new(sampling.into());
+        let runner = Gpt2Runner::new(&self.model, &self.backend, Arc::clone(&self.hooks)).map_err(jserr)?;
+
+        let start = now_ms();
+        let mut ids: Vec<u32> = self.tokenizer.encode(prompt);
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new as usize);
+        for _ in 0..max_new {
+            let logits = runner.forward(&ids).map_err(jserr)?;
+            let last = runner.last_position_logits(&logits).map_err(jserr)?;
+            let next = sampler.sample(&last);
+            ids.push(next);
+            generated.push(next);
+        }
+        let elapsed = now_ms() - start;
+        let tps = if elapsed > 0.0 { (generated.len() as f64) / (elapsed / 1000.0) } else { 0.0 };
+
+        let text = self.tokenizer.decode(&generated);
+        let out = GenerateOutput { tokens: generated, text, elapsed_ms: elapsed, tokens_per_second: tps };
+        serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen(js_name = backendName)]
@@ -115,4 +151,11 @@ impl Glassbox {
 
 fn jserr(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
+}
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
 }

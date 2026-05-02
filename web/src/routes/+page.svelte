@@ -25,6 +25,20 @@
         return arr;
     }
 
+    function patternFromHook(layer: number, head: number, seq: number): Float32Array | null {
+        if (!session.handle || !session.info) return null;
+        const buf = session.handle.readHook(`blocks.${layer}.attn.pattern`);
+        if (!buf) return null;
+        const heads = session.info.n_head;
+        const expected = heads * seq * seq;
+        if (buf.length !== expected) return null;
+        return buf.slice(head * seq * seq, (head + 1) * seq * seq);
+    }
+
+    function getAttentionPattern(layer: number, head: number): Float32Array | null {
+        return patternFromHook(layer, head, seqLen) ?? fakePattern(layer, head, seqLen);
+    }
+
     function fakeProjection(layer: number, position: number): [number, number] {
         const t = layer / 12;
         const drift = Math.sin(position * 0.7 + layer * 0.3) * 0.5;
@@ -66,10 +80,32 @@
         }
     }
 
-    function generate() {
+    async function generate() {
+        if (!session.handle) return;
         session.isGenerating = true;
+        session.generated = [];
+        session.generatedText = '';
         try {
-            session.generated = [];
+            session.handle.clearHooks();
+            const subscriptions = [
+                `blocks.${session.selectedLayer}.attn.pattern`,
+                `blocks.${session.selectedLayer}.resid_post`,
+                `blocks.${session.selectedLayer}.mlp.post`,
+            ];
+            for (const s of subscriptions) session.handle.subscribe(s);
+
+            const result = session.handle.generate(session.prompt, session.maxNewTokens, {
+                temperature: session.temperature,
+                top_k: session.topK,
+                top_p: session.topP,
+                seed: 42,
+            });
+            session.generated = Array.from(result.tokens);
+            session.generatedText = result.text;
+            session.elapsedMs = result.elapsed_ms;
+            session.tokensPerSecond = result.tokens_per_second;
+        } catch (e) {
+            session.error = e instanceof Error ? e.message : String(e);
         } finally {
             session.isGenerating = false;
         }
@@ -137,9 +173,26 @@
         <section>
             <h3 class="mono">prompt</h3>
             <textarea bind:value={session.prompt} rows="4"></textarea>
+            <div class="row3 mono">
+                <label>max <input type="number" bind:value={session.maxNewTokens} min="1" max="256" /></label>
+                <label>temp <input type="number" bind:value={session.temperature} step="0.05" min="0" max="2" /></label>
+                <label>top-k <input type="number" bind:value={session.topK} min="0" max="200" /></label>
+            </div>
             <button onclick={generate} disabled={!session.handle || session.isGenerating}>
                 {session.isGenerating ? 'generating…' : 'generate'}
             </button>
+            {#if session.generatedText || session.elapsedMs > 0}
+                <div class="output mono">
+                    {#if session.generatedText}
+                        <div class="generated">{session.generatedText}</div>
+                    {/if}
+                    {#if session.elapsedMs > 0}
+                        <div class="dim small">
+                            {session.elapsedMs.toFixed(0)} ms · {session.tokensPerSecond.toFixed(1)} tok/s
+                        </div>
+                    {/if}
+                </div>
+            {/if}
         </section>
 
         <div class="divider"></div>
@@ -173,7 +226,7 @@
                 nLayers={Math.min(6, session.info.n_layer)}
                 nHeads={session.info.n_head}
                 {seqLen}
-                getPattern={(l, h) => fakePattern(l, h, seqLen)}
+                getPattern={(l, h) => getAttentionPattern(l, h)}
                 selectedLayer={session.selectedLayer}
                 selectedHead={session.selectedHead}
                 onSelect={(l, h) => {
@@ -334,5 +387,38 @@
         justify-content: center;
         font-size: 13px;
         color: var(--fg-2);
+    }
+    .row3 {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 6px;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--fg-3);
+    }
+    .row3 input {
+        width: 100%;
+        font-size: 11px;
+        padding: 4px 6px;
+        margin-top: 2px;
+    }
+    .output {
+        margin-top: 8px;
+        padding: 8px;
+        background: var(--bg-2);
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-sm);
+        font-size: 11px;
+    }
+    .generated {
+        color: var(--fg-0);
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.45;
+    }
+    .small {
+        font-size: 9px;
+        margin-top: 6px;
     }
 </style>
