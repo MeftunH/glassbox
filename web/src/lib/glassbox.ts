@@ -21,6 +21,27 @@ export interface GenerateOutput {
     tokens_per_second: number;
 }
 
+export interface PathPatchArgs {
+    clean_prompt: string;
+    corrupt_prompt: string;
+    sender_hook: string;
+    receiver_hooks: string[];
+    target_token: number | null;
+}
+
+export interface PathPatchOut {
+    clean_logit: number;
+    corrupt_logit: number;
+    patched_logit: number;
+    recovery: number;
+    elapsed_ms: number;
+}
+
+export interface SaeFeatureSpike {
+    feature: number;
+    activation: number;
+}
+
 export interface GlassboxHandle {
     modelInfo(): ModelInfo;
     encode(text: string): Uint32Array;
@@ -31,6 +52,19 @@ export interface GlassboxHandle {
     clearHooks(): void;
     forward(ids: Uint32Array): Float32Array;
     generate(prompt: string, maxNew: number, args: SamplingArgs): GenerateOutput;
+    runPathPatch(args: PathPatchArgs): PathPatchOut;
+    loadSae(
+        key: string,
+        d_in: number,
+        d_features: number,
+        w_enc: Float32Array,
+        b_enc: Float32Array,
+        w_dec: Float32Array,
+        b_dec: Float32Array
+    ): void;
+    encodeSaeFromHook(saeKey: string, hook: string, topK: number): SaeFeatureSpike[];
+    installPatch(hook: string, data: Float32Array, shape: Uint32Array): void;
+    clearPatches(): void;
     backendName(): string;
 }
 

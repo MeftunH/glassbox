@@ -14,11 +14,12 @@
 - `generate(prompt, max_new, sampling)` on the wasm surface returning tokens, decoded text, elapsed ms, and tok/s.
 - Path patching primitive (`run_path_patch`) implementing the clean/corrupt/repatch dance from Wang et al., with a recovery score.
 - Sparse autoencoder primitive (`SparseAutoencoder` with ReLU encode + linear decode) and `top_k_features` for feature discovery on captured activations.
-- SvelteKit 2 + Svelte 5 (runes) web shell with attention grid, residual river, neuron atlas, and circuit canvas views; the attention grid reads real captured patterns when a model is loaded.
+- SvelteKit 2 + Svelte 5 (runes) web shell with attention grid, residual river, neuron atlas, circuit canvas, and path-patching panel views; the attention grid reads real captured patterns when a model is loaded.
+- Wasm surface for the interp primitives: `runPathPatch`, `loadSae` / `encodeSaeFromHook`, `installPatch` / `clearPatches`. The path-patching panel drives the first three end-to-end from the browser.
 - ARCHITECTURE.md, perf-notes, GPT-2 hook reference.
 
 ### Known limitations
 
 - Tensors are CPU-resident around each WebGPU call (upload + dispatch + download per op). GPU-resident weights and intermediates are next on the perf list; the kernels themselves are already there.
 - Generate runs on the CPU backend in WASM; routing the runner through the WebGPU backend in the browser is the natural follow-up.
-- The web app ships UI scaffolding for path patching and SAE feature discovery, but the wasm bindings for those primitives are not yet exposed (only the Rust-side `glassbox-interp` API).
+- SAE feature discovery is wired in the wasm bindings but the corresponding UI panel is not yet built; users can drive it from the browser console via the `Glassbox` handle.

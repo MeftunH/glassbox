@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use glassbox_core::{Shape, Tensor};
+use glassbox_interp::{run_path_patch, top_k_features, PathPatchResult, PathPatchSpec, SparseAutoencoder};
 use glassbox_models::{Bpe, GlxFile, Gpt2, Gpt2Runner};
 use glassbox_runtime::{Backend, CpuBackend, HookRegistry, SamplingConfig, Sampler};
 use serde::{Deserialize, Serialize};
@@ -42,6 +44,48 @@ pub struct GenerateOutput {
     pub tokens_per_second: f64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PathPatchArgs {
+    pub clean_prompt: String,
+    pub corrupt_prompt: String,
+    pub sender_hook: String,
+    pub receiver_hooks: Vec<String>,
+    pub target_token: Option<u32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PathPatchOut {
+    pub clean_logit: f32,
+    pub corrupt_logit: f32,
+    pub patched_logit: f32,
+    pub recovery: f32,
+    pub elapsed_ms: f64,
+}
+
+impl From<PathPatchResult> for PathPatchOut {
+    fn from(r: PathPatchResult) -> Self {
+        Self {
+            clean_logit: r.clean_logit,
+            corrupt_logit: r.corrupt_logit,
+            patched_logit: r.patched_logit,
+            recovery: r.recovery,
+            elapsed_ms: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SaeShape {
+    pub d_in: usize,
+    pub d_features: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SaeFeatureSpike {
+    pub feature: usize,
+    pub activation: f32,
+}
+
 #[wasm_bindgen]
 #[derive(Debug)]
 pub struct Glassbox {
@@ -49,6 +93,7 @@ pub struct Glassbox {
     tokenizer: Bpe,
     hooks: Arc<HookRegistry>,
     backend: CpuBackend,
+    saes: std::sync::Mutex<ahash::AHashMap<String, SparseAutoencoder>>,
 }
 
 #[wasm_bindgen]
@@ -69,6 +114,7 @@ impl Glassbox {
             tokenizer,
             hooks: HookRegistry::new(),
             backend: CpuBackend,
+            saes: std::sync::Mutex::new(ahash::AHashMap::new()),
         })
     }
 
@@ -146,6 +192,101 @@ impl Glassbox {
     #[wasm_bindgen(js_name = backendName)]
     pub fn backend_name(&self) -> String {
         Backend::name(&self.backend).to_string()
+    }
+
+    #[wasm_bindgen(js_name = runPathPatch)]
+    pub fn run_path_patch(&self, args: JsValue) -> Result<JsValue, JsValue> {
+        let args: PathPatchArgs = serde_wasm_bindgen::from_value(args)
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let clean_ids = self.tokenizer.encode(&args.clean_prompt);
+        let corrupt_ids = self.tokenizer.encode(&args.corrupt_prompt);
+        if clean_ids.len() != corrupt_ids.len() {
+            return Err(JsValue::from_str(&format!(
+                "clean and corrupt prompts must tokenise to the same length (got {} and {})",
+                clean_ids.len(),
+                corrupt_ids.len()
+            )));
+        }
+        let spec = PathPatchSpec {
+            clean_ids,
+            corrupt_ids,
+            sender_hook: args.sender_hook,
+            receiver_hooks: args.receiver_hooks,
+            target_token: args.target_token,
+        };
+        let start = now_ms();
+        let result = run_path_patch(&self.model, &self.backend, &spec).map_err(jserr)?;
+        let mut out: PathPatchOut = result.into();
+        out.elapsed_ms = now_ms() - start;
+        serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = loadSae)]
+    pub fn load_sae(
+        &self,
+        key: &str,
+        d_in: usize,
+        d_features: usize,
+        w_enc: &[f32],
+        b_enc: &[f32],
+        w_dec: &[f32],
+        b_dec: &[f32],
+    ) -> Result<(), JsValue> {
+        let w_enc = Tensor::from_f32(w_enc, Shape::from([d_in, d_features])).map_err(jserr)?;
+        let b_enc = Tensor::from_f32(b_enc, Shape::from([d_features])).map_err(jserr)?;
+        let w_dec = Tensor::from_f32(w_dec, Shape::from([d_features, d_in])).map_err(jserr)?;
+        let b_dec = Tensor::from_f32(b_dec, Shape::from([d_in])).map_err(jserr)?;
+        let sae = SparseAutoencoder::new(d_in, d_features, w_enc, b_enc, w_dec, b_dec).map_err(jserr)?;
+        if let Ok(mut map) = self.saes.lock() {
+            map.insert(key.into(), sae);
+        }
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = encodeSaeFromHook)]
+    pub fn encode_sae_from_hook(&self, sae_key: &str, hook: &str, top_k: usize) -> Result<JsValue, JsValue> {
+        let snap = self.hooks.snapshot();
+        let activation = snap
+            .get(hook)
+            .ok_or_else(|| JsValue::from_str(&format!("hook `{hook}` not captured")))?;
+
+        let map = self.saes.lock().map_err(|_| JsValue::from_str("sae mutex poisoned"))?;
+        let sae = map
+            .get(sae_key)
+            .ok_or_else(|| JsValue::from_str(&format!("sae `{sae_key}` not loaded")))?;
+
+        let activation_2d = if activation.rank() == 2 {
+            activation.clone()
+        } else if activation.rank() == 3 {
+            let dims = activation.shape().dims();
+            activation.reshape([dims[0] * dims[1], dims[2]]).map_err(jserr)?
+        } else {
+            return Err(JsValue::from_str(&format!(
+                "unsupported rank {} for sae input",
+                activation.rank()
+            )));
+        };
+
+        let features = sae.encode(&self.backend, &activation_2d).map_err(jserr)?;
+        let top = top_k_features(&features, top_k).map_err(jserr)?;
+        let result: Vec<SaeFeatureSpike> = top
+            .into_iter()
+            .map(|(feature, activation)| SaeFeatureSpike { feature, activation })
+            .collect();
+        serde_wasm_bindgen::to_value(&result).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[wasm_bindgen(js_name = installPatch)]
+    pub fn install_patch(&self, hook: &str, data: &[f32], shape: &[u32]) -> Result<(), JsValue> {
+        let shape: Vec<usize> = shape.iter().map(|&v| v as usize).collect();
+        let tensor = Tensor::from_f32(data, Shape::from(shape)).map_err(jserr)?;
+        self.hooks.install_patch(hook.to_string(), tensor);
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = clearPatches)]
+    pub fn clear_patches(&self) {
+        self.hooks.clear_patches();
     }
 }
 

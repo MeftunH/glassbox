@@ -20,7 +20,7 @@ authors = ["glassbox contributors"]
 glassbox-core    = { path = "crates/glassbox-core",    version = "0.1.0" }
 glassbox-runtime = { path = "crates/glassbox-runtime", version = "0.1.0" }
 glassbox-models  = { path = "crates/glassbox-models",  version = "0.1.0" }
-glassbox-interp  = { path = "crates/glassbox-interp",  version = "0.1.0" }
+glassbox-interp  = { path = "crates/glassbox-interp",  version = "0.1.0", default-features = false }
 
 thiserror     = "2"
 anyhow        = "1"
