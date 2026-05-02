@@ -1,0 +1,29 @@
+[package]
+name = "glassbox-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+glassbox-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+ahash.workspace = true
+smallvec.workspace = true
+rand.workspace = true
+
+rayon = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+
+[features]
+default = ["cpu"]
+cpu = ["dep:rayon"]
+wgpu = ["dep:wgpu", "dep:pollster"]

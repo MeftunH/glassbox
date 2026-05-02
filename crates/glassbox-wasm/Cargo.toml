@@ -1,0 +1,29 @@
+[package]
+name = "glassbox-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+glassbox-core.workspace = true
+glassbox-runtime.workspace = true
+glassbox-models.workspace = true
+glassbox-interp.workspace = true
+wasm-bindgen.workspace = true
+js-sys.workspace = true
+web-sys = { workspace = true, features = ["Window", "Performance", "console"] }
+serde-wasm-bindgen.workspace = true
+console_error_panic_hook.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
