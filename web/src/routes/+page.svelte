@@ -263,8 +263,26 @@
         {:else if activeView === 'sae' && session.handle && session.info}
             <SaePanel handle={session.handle} nLayers={session.info.n_layer} />
         {:else}
-            <div class="empty">
-                <div class="mono dim">load a model to begin</div>
+            <div class="hero">
+                <div class="hero-inner">
+                    <h1 class="hero-headline mono">a transformer you can see through</h1>
+                    <p class="hero-sub mono">browser-native GPT-2 + mechanistic interpretability — runs entirely in your tab via WebGPU</p>
+                    <div class="hero-cards">
+                        <div class="hero-card mono">
+                            <div class="hero-card-title">see</div>
+                            <div class="hero-card-body">attention heads, residual streams, neuron firings — every internal tensor is addressable and drawn live as the model runs.</div>
+                        </div>
+                        <div class="hero-card mono">
+                            <div class="hero-card-title">intervene</div>
+                            <div class="hero-card-body">patch activations between clean and corrupted prompts, route counterfactuals along single edges, watch the logits move.</div>
+                        </div>
+                        <div class="hero-card mono">
+                            <div class="hero-card-title">explore</div>
+                            <div class="hero-card-body">project intermediates through the unembedding, surface top-k MLP features, sketch a circuit and run it end to end.</div>
+                        </div>
+                    </div>
+                    <div class="hero-foot mono">v0.1 · MIT · github.com/MeftunH/glassbox</div>
+                </div>
             </div>
         {/if}
     </section>
@@ -431,5 +449,72 @@
     .small {
         font-size: 9px;
         margin-top: 6px;
+    }
+    .hero {
+        height: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 32px 24px;
+    }
+    .hero-inner {
+        width: 100%;
+        max-width: 760px;
+        display: flex;
+        flex-direction: column;
+        gap: 28px;
+    }
+    .hero-headline {
+        font-size: clamp(26px, 4vw, 38px);
+        line-height: 1.1;
+        letter-spacing: -0.01em;
+        color: var(--fg-0);
+        font-weight: 500;
+        margin: 0;
+    }
+    .hero-sub {
+        font-size: 12px;
+        line-height: 1.6;
+        color: var(--fg-2);
+        margin: 0;
+        max-width: 60ch;
+    }
+    .hero-cards {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin-top: 4px;
+    }
+    .hero-card {
+        border: 1px solid var(--line-soft);
+        border-radius: var(--radius-sm);
+        padding: 16px;
+        background: var(--bg-1);
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+    .hero-card-title {
+        font-size: 11px;
+        font-weight: 500;
+        color: var(--fg-0);
+        letter-spacing: 0.06em;
+        text-transform: lowercase;
+    }
+    .hero-card-body {
+        font-size: 11px;
+        line-height: 1.55;
+        color: var(--fg-2);
+    }
+    .hero-foot {
+        font-size: 10px;
+        color: var(--fg-3);
+        letter-spacing: 0.04em;
+        margin-top: 4px;
+    }
+    @media (max-width: 720px) {
+        .hero-cards {
+            grid-template-columns: 1fr;
+        }
     }
 </style>

@@ -18,11 +18,11 @@ pub struct Bpe {
 
 impl Bpe {
     pub fn from_blob(blob: BpeBlob) -> Self {
-        let mut inv = vec![String::new(); blob.vocab.len()];
+        let max_id = blob.vocab.values().copied().max().unwrap_or(0) as usize;
+        let inv_len = (max_id + 1).max(blob.vocab.len());
+        let mut inv = vec![String::new(); inv_len];
         for (token, &id) in &blob.vocab {
-            if (id as usize) < inv.len() {
-                inv[id as usize] = token.clone();
-            }
+            inv[id as usize] = token.clone();
         }
         let merge_rank: AHashMap<_, _> = blob
             .merges
@@ -99,14 +99,37 @@ impl Bpe {
     }
 }
 
+fn byte_encode(c: char) -> char {
+    match c {
+        ' ' => '\u{0120}',
+        '\n' => '\u{010A}',
+        '\t' => '\u{0109}',
+        _ => c,
+    }
+}
+
 fn pretokenise(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     let mut buf = String::new();
-    for c in text.chars() {
-        if c.is_whitespace() && !buf.is_empty() {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == ' ' || c == '\n' || c == '\t' {
+            if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+            buf.push(byte_encode(c));
+            i += 1;
+            while i < chars.len() && !chars[i].is_whitespace() {
+                buf.push(byte_encode(chars[i]));
+                i += 1;
+            }
             out.push(std::mem::take(&mut buf));
+            continue;
         }
-        buf.push(c);
+        buf.push(byte_encode(c));
+        i += 1;
     }
     if !buf.is_empty() {
         out.push(buf);
@@ -115,7 +138,9 @@ fn pretokenise(text: &str) -> Vec<String> {
 }
 
 fn unbyte(s: &str) -> String {
-    s.replace('\u{0120}', " ").replace('\u{010A}', "\n")
+    s.replace('\u{0120}', " ")
+        .replace('\u{010A}', "\n")
+        .replace('\u{0109}', "\t")
 }
 
 #[cfg(test)]
@@ -127,5 +152,26 @@ mod tests {
         let bpe = Bpe::from_blob(BpeBlob { vocab: AHashMap::new(), merges: vec![] });
         assert_eq!(bpe.vocab_size(), 0);
         assert_eq!(bpe.encode("hello"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn pretokenise_byte_encodes_spaces() {
+        let pre = pretokenise("hello world");
+        assert_eq!(pre, vec!["hello".to_string(), "\u{0120}world".to_string()]);
+    }
+
+    #[test]
+    fn pretokenise_byte_encodes_newlines() {
+        let pre = pretokenise("foo\nbar");
+        assert_eq!(pre, vec!["foo".to_string(), "\u{010A}bar".to_string()]);
+    }
+
+    #[test]
+    fn unbyte_round_trips_through_decode() {
+        let mut vocab = AHashMap::new();
+        vocab.insert("\u{0120}hello".into(), 1u32);
+        vocab.insert("\u{010A}world".into(), 2u32);
+        let bpe = Bpe::from_blob(BpeBlob { vocab, merges: vec![] });
+        assert_eq!(bpe.decode(&[1, 2]), " hello\nworld");
     }
 }

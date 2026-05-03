@@ -1,4 +1,10 @@
+```
+◇ glassbox
+```
+
 # glassbox
+
+`Rust 1.78+` | `WebGPU` | `38 tests passing` | `MIT`
 
 A transformer you can see through.
 
@@ -11,6 +17,10 @@ It exists because most of us are told "transformers do X" and have to take it on
 ## Demo
 
 `https://glassbox.dev` — loads a 124M-parameter GPT-2 in roughly six seconds on an integrated GPU, two on a discrete one. No install, no signup, no server: weights are streamed from a CDN and inference happens in your browser.
+
+### Why this exists
+
+glassbox is the artifact of an effort to understand transformers from the inside — not a product, not a framework, not anything you should depend on. It exists because reading about attention is not the same as watching a head form on your own screen. Use it if it helps you see something.
 
 Screenshots and a thirty-second walkthrough live in [docs/media/](./docs/media/).
 
@@ -115,15 +125,15 @@ These are the targets the WGSL kernels are tuned against. The current default br
 ## What works today
 
 - [x] GPT-2 small forward pass on WebGPU and CPU
-- [x] Greedy, top-k, top-p, temperature sampling
+- [x] Greedy / top-k / top-p / temperature sampling
 - [x] Attention pattern extraction
 - [x] Residual stream extraction at every block
 - [x] Direct logit attribution at any layer
 - [x] Activation patching (clean ↔ corrupted run)
-- [ ] Path patching — in progress, behind feature flag
+- [x] Path patching
+- [x] Sparse autoencoder hooks for feature discovery
 - [ ] Pythia 70M / 160M
-- [ ] In-browser autograd (training a probe on the fly)
-- [ ] Sparse autoencoder hooks for feature discovery
+- [ ] In-browser autograd
 
 ## Project layout
 

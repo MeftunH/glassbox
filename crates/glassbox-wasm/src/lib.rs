@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use glassbox_core::{Shape, Tensor};
 use glassbox_interp::{run_path_patch, top_k_features, PathPatchResult, PathPatchSpec, SparseAutoencoder};
-use glassbox_models::{Bpe, GlxFile, Gpt2, Gpt2Runner};
-use glassbox_runtime::{Backend, CpuBackend, HookRegistry, SamplingConfig, Sampler};
+use glassbox_models::{Bpe, GlxFile, Gpt2, Gpt2Runner, Gpt2RunnerAsync};
+use glassbox_runtime::{AsyncBackend, Backend, CpuBackend, HookRegistry, SamplingConfig, Sampler};
 use glassbox_runtime::wgpu_backend::WgpuBackend;
 use wasm_bindgen_futures::future_to_promise;
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,13 @@ impl BackendChoice {
             BackendChoice::Wgpu(b) => b,
         }
     }
+
+    fn as_async_backend(&self) -> &dyn AsyncBackend {
+        match self {
+            BackendChoice::Cpu(b) => b,
+            BackendChoice::Wgpu(b) => b,
+        }
+    }
 }
 
 impl std::fmt::Debug for BackendChoice {
@@ -114,8 +121,8 @@ pub struct Glassbox {
     model: Arc<Gpt2>,
     tokenizer: Bpe,
     hooks: Arc<HookRegistry>,
-    backend: BackendChoice,
-    saes: std::sync::Mutex<ahash::AHashMap<String, SparseAutoencoder>>,
+    backend: Arc<BackendChoice>,
+    saes: Arc<std::sync::Mutex<ahash::AHashMap<String, SparseAutoencoder>>>,
 }
 
 #[wasm_bindgen]
@@ -127,8 +134,8 @@ impl Glassbox {
             model: Arc::new(model),
             tokenizer,
             hooks: HookRegistry::new(),
-            backend: BackendChoice::Cpu(CpuBackend),
-            saes: std::sync::Mutex::new(ahash::AHashMap::new()),
+            backend: Arc::new(BackendChoice::Cpu(CpuBackend)),
+            saes: Arc::new(std::sync::Mutex::new(ahash::AHashMap::new())),
         })
     }
 
@@ -142,8 +149,8 @@ impl Glassbox {
                 model: Arc::new(model),
                 tokenizer,
                 hooks: HookRegistry::new(),
-                backend: BackendChoice::Wgpu(backend),
-                saes: std::sync::Mutex::new(ahash::AHashMap::new()),
+                backend: Arc::new(BackendChoice::Wgpu(backend)),
+                saes: Arc::new(std::sync::Mutex::new(ahash::AHashMap::new())),
             };
             Ok(JsValue::from(glass))
         })
@@ -223,6 +230,40 @@ impl Glassbox {
     #[wasm_bindgen(js_name = backendName)]
     pub fn backend_name(&self) -> String {
         self.backend.as_backend().name().to_string()
+    }
+
+    #[wasm_bindgen(js_name = generateAsync)]
+    pub fn generate_async(&self, prompt: String, max_new: u32, args: JsValue) -> js_sys::Promise {
+        let model = Arc::clone(&self.model);
+        let tokenizer = self.tokenizer.clone();
+        let hooks = Arc::clone(&self.hooks);
+        let backend = Arc::clone(&self.backend);
+        let sampling_args: SamplingArgs = match serde_wasm_bindgen::from_value(args) {
+            Ok(v) => v,
+            Err(e) => return js_sys::Promise::reject(&JsValue::from_str(&e.to_string())),
+        };
+
+        future_to_promise(async move {
+            let mut sampler = Sampler::new(sampling_args.into());
+            let runner = Gpt2RunnerAsync::new(&model, backend.as_async_backend(), hooks).map_err(jserr)?;
+
+            let start = now_ms();
+            let mut ids: Vec<u32> = tokenizer.encode(&prompt);
+            let mut generated: Vec<u32> = Vec::with_capacity(max_new as usize);
+            for _ in 0..max_new {
+                let logits = runner.forward(&ids).await.map_err(jserr)?;
+                let last = runner.last_position_logits(&logits).await.map_err(jserr)?;
+                let next = sampler.sample(&last);
+                ids.push(next);
+                generated.push(next);
+            }
+            let elapsed = now_ms() - start;
+            let tps = if elapsed > 0.0 { (generated.len() as f64) / (elapsed / 1000.0) } else { 0.0 };
+
+            let text = tokenizer.decode(&generated);
+            let out = GenerateOutput { tokens: generated, text, elapsed_ms: elapsed, tokens_per_second: tps };
+            serde_wasm_bindgen::to_value(&out).map_err(|e| JsValue::from_str(&e.to_string()))
+        })
     }
 
     #[wasm_bindgen(js_name = runPathPatch)]

@@ -21,6 +21,9 @@
 - Pure-GPU `add` and `embed` WGSL kernels (replace previous CPU round-trips). The wgpu backend now never falls back to CPU during the per-block forward op set.
 - `WgpuBackend::download_async` for async readback via `futures-channel` oneshot, gated on `device.poll(Wait)` only on native targets so the browser path is non-blocking.
 - Sparse-autoencoder feature explorer view (`SaePanel.svelte`): load an SAE from a JSON file, probe an arbitrary text against any captured hook, and see the top-K firing features as bar plots.
+- Async runner: `Gpt2RunnerAsync` and `AsyncBackend` trait (with `download_async`) so the browser path can `await` GPU readbacks instead of blocking the JS event loop. The wasm surface gains `Glassbox.generateAsync(prompt, max_new, args)` returning a `Promise<GenerateOutput>`.
+- End-to-end validation against real GPT-2: a `cargo run --release --example cli_generate` example now loads `models/gpt2-small.glx` (124M params, 477 MB) and produces coherent English continuations through the Rust forward pass on the CPU backend.
+- BPE byte-encoding fix in `glassbox-models::tokenizer`: spaces and newlines now byte-encode to `Ġ`/`Ċ` during pretokenisation so HF GPT-2 vocab merges resolve correctly. Encode/decode round-trip is regression-tested.
 - ARCHITECTURE.md, perf-notes, GPT-2 hook reference.
 
 ### Known limitations
