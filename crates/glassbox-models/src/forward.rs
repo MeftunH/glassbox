@@ -44,7 +44,8 @@ impl<'a> Gpt2Runner<'a> {
             let n1 = self.layer_norm(&x, &block.ln_1_g, &block.ln_1_b, cfg.layer_norm_epsilon)?;
 
             let qkv = self.linear(&n1, &block.attn_c_attn_w, &block.attn_c_attn_b)?;
-            let (q, k, v) = split_qkv(&qkv, d)?;
+            let qkv_cpu = ensure_cpu(self.backend, &qkv)?;
+            let (q, k, v) = split_qkv(&qkv_cpu, d)?;
             let q4 = reshape_to_heads(&q, seq, n_head, head_dim)?;
             let k4 = reshape_to_heads(&k, seq, n_head, head_dim)?;
             let v4 = reshape_to_heads(&v, seq, n_head, head_dim)?;
@@ -61,7 +62,8 @@ impl<'a> Gpt2Runner<'a> {
             let _pattern = self.intercept(&gpt2_hooks::block_attn_pattern(layer), pattern_buf);
             let attn_z = self.intercept(&gpt2_hooks::block_attn_z(layer), attn_z);
 
-            let attn_merged = merge_heads(&attn_z, seq, n_head, head_dim)?;
+            let attn_z_cpu = ensure_cpu(self.backend, &attn_z)?;
+            let attn_merged = merge_heads(&attn_z_cpu, seq, n_head, head_dim)?;
             let attn_out = self.linear(&attn_merged, &block.attn_c_proj_w, &block.attn_c_proj_b)?;
 
             x = self.add(&x, &attn_out)?;
@@ -89,7 +91,8 @@ impl<'a> Gpt2Runner<'a> {
     pub fn last_position_logits(&self, logits: &Tensor) -> Result<Vec<f32>> {
         let cfg = &self.model.config;
         let vocab = cfg.vocab_size;
-        let data = logits.as_f32().map_err(ModelError::from)?;
+        let logits_cpu = ensure_cpu(self.backend, logits)?;
+        let data = logits_cpu.as_f32().map_err(ModelError::from)?;
         let seq = data.len() / vocab;
         let off = (seq - 1) * vocab;
         Ok(data[off..off + vocab].to_vec())
@@ -115,8 +118,10 @@ impl<'a> Gpt2Runner<'a> {
         let n = w.shape().dim(1).map_err(ModelError::from)?;
         let mut y = Tensor::from_f32(&vec![0.0; m * n], Shape::from([m, n])).map_err(ModelError::from)?;
         self.backend.matmul(x, w, &mut y).map_err(ModelError::from)?;
-        add_row_bias(&mut y, b)?;
-        Ok(y)
+        let y_cpu = ensure_cpu(self.backend, &y)?;
+        let mut y_cpu = y_cpu;
+        add_row_bias(&mut y_cpu, b)?;
+        Ok(y_cpu)
     }
 
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
@@ -163,6 +168,13 @@ impl<'a> Gpt2Runner<'a> {
             computed
         }
     }
+}
+
+fn ensure_cpu(backend: &dyn Backend, t: &Tensor) -> Result<Tensor> {
+    if matches!(t.storage(), glassbox_core::Storage::Cpu(_)) {
+        return Ok(t.clone());
+    }
+    backend.download(t).map_err(ModelError::from)
 }
 
 fn transpose_2d(t: &Tensor) -> Result<Tensor> {

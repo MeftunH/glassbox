@@ -18,9 +18,12 @@
 - Wasm surface for the interp primitives: `runPathPatch`, `loadSae` / `encodeSaeFromHook`, `installPatch` / `clearPatches`. The path-patching panel drives the first three end-to-end from the browser.
 - GPU-resident tensor path on `WgpuBackend`: a buffer pool maps every `BufferId` to a live `wgpu::Buffer`, ops accept GPU-resident inputs and emit GPU-resident outputs without intermediate readback. New `Backend::alloc`, `upload`, and `download` round out the trait. Six dedicated tests cover round-trip, chained matmul (no readback between ops), and softmax/attention parity against the CPU reference.
 - WebGPU is wired through to the wasm bundle and the browser. `Glassbox.fromBlobWebGpu(blob)` is an async constructor that initialises a real `WgpuBackend` against `navigator.gpu`. The web app probes for WebGPU on load, falls back to CPU on browsers without it, and tags the active backend in the top bar.
+- Pure-GPU `add` and `embed` WGSL kernels (replace previous CPU round-trips). The wgpu backend now never falls back to CPU during the per-block forward op set.
+- `WgpuBackend::download_async` for async readback via `futures-channel` oneshot, gated on `device.poll(Wait)` only on native targets so the browser path is non-blocking.
+- Sparse-autoencoder feature explorer view (`SaePanel.svelte`): load an SAE from a JSON file, probe an arbitrary text against any captured hook, and see the top-K firing features as bar plots.
 - ARCHITECTURE.md, perf-notes, GPT-2 hook reference.
 
 ### Known limitations
 
-- `WgpuBackend::download` blocks the calling thread on `device.poll(Wait)`. On native that is fine; in the browser the readback only completes naturally inside the JS event loop, so generate calls that ultimately need to read logits back have to be driven from an async path. The `from_blob_webgpu` constructor and weight upload work today; the async-aware generate path is the immediate follow-up.
+- The runner's helpers (`split_qkv`, `reshape_to_heads`, `merge_heads`, `add_row_bias`) operate on CPU tensors and currently call the sync `Backend::download` to reach them. Native WebGPU works end-to-end; in the browser those sync downloads would block the JS event loop, so the browser path defaults to the CPU backend. Promoting the runner to async (using `WgpuBackend::download_async`, which is already in place) is what unlocks browser-WebGPU generate.
 - SAE feature discovery is wired in the wasm bindings but the corresponding UI panel is not yet built; users can drive it from the browser console via the `Glassbox` handle.

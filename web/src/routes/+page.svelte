@@ -5,11 +5,12 @@
     import NeuronAtlas from '$lib/viz/NeuronAtlas.svelte';
     import CircuitCanvas from '$lib/viz/CircuitCanvas.svelte';
     import PathPatchPanel from '$lib/viz/PathPatchPanel.svelte';
+    import SaePanel from '$lib/viz/SaePanel.svelte';
     import { session } from '$lib/stores/session.svelte';
     import { formatBytes, formatParams, loadGlassbox } from '$lib/glassbox';
 
     let modelUrl = $state('/models/gpt2-small.glx');
-    let activeView = $state<'attention' | 'river' | 'atlas' | 'circuit' | 'patch'>('attention');
+    let activeView = $state<'attention' | 'river' | 'atlas' | 'circuit' | 'patch' | 'sae'>('attention');
 
     function fakePattern(layer: number, head: number, seq: number): Float32Array {
         const arr = new Float32Array(seq * seq);
@@ -126,7 +127,7 @@
         <span class="tag">v0.1</span>
     </div>
     <nav class="views">
-        {#each ['attention', 'river', 'atlas', 'circuit', 'patch'] as v}
+        {#each ['attention', 'river', 'atlas', 'circuit', 'patch', 'sae'] as v}
             <button class:active={activeView === v} onclick={() => (activeView = v as typeof activeView)}>
                 {v}
             </button>
@@ -259,6 +260,8 @@
             <CircuitCanvas nLayers={session.info.n_layer} edges={fakeEdges} />
         {:else if activeView === 'patch' && session.handle && session.info}
             <PathPatchPanel handle={session.handle} nLayers={session.info.n_layer} />
+        {:else if activeView === 'sae' && session.handle && session.info}
+            <SaePanel handle={session.handle} nLayers={session.info.n_layer} />
         {:else}
             <div class="empty">
                 <div class="mono dim">load a model to begin</div>

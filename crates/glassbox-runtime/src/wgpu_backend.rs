@@ -16,6 +16,8 @@ pub const SHADER_SOFTMAX: &str = include_str!("../../../shaders/softmax.wgsl");
 pub const SHADER_LAYERNORM: &str = include_str!("../../../shaders/layernorm.wgsl");
 pub const SHADER_GELU: &str = include_str!("../../../shaders/gelu.wgsl");
 pub const SHADER_ATTENTION: &str = include_str!("../../../shaders/attention.wgsl");
+pub const SHADER_ADD: &str = include_str!("../../../shaders/add.wgsl");
+pub const SHADER_EMBED: &str = include_str!("../../../shaders/embed.wgsl");
 
 #[derive(Debug)]
 pub struct WgpuBackend {
@@ -172,6 +174,51 @@ impl WgpuBackend {
         Tensor::from_gpu(id, shape, dtype)
     }
 
+    pub async fn download_async(&self, tensor: &Tensor) -> Result<Tensor> {
+        match tensor.storage() {
+            Storage::Cpu(_) => Ok(tensor.clone()),
+            Storage::Gpu(id) => {
+                let buf = self.get(*id)?;
+                let byte_len = (tensor.numel() * tensor.dtype().size()) as u64;
+                let data = self.read_back_f32_bytes_async(&buf, byte_len).await?;
+                Tensor::from_f32(&data, tensor.shape().clone()).map_err(RuntimeError::from)
+            }
+        }
+    }
+
+    async fn read_back_f32_bytes_async(&self, buf: &wgpu::Buffer, byte_len: u64) -> Result<Vec<f32>> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("glassbox/staging-async"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("glassbox/readback-async") });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, byte_len);
+        self.queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = futures_channel::oneshot::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+
+        #[cfg(not(target_arch = "wasm32"))]
+        self.device.poll(wgpu::Maintain::Wait);
+
+        rx.await
+            .map_err(|e| RuntimeError::Wgpu(format!("readback channel: {e}")))?
+            .map_err(|e| RuntimeError::Wgpu(format!("map_async: {e}")))?;
+
+        let data = slice.get_mapped_range();
+        let out: Vec<f32> = cast_slice(&data).to_vec();
+        drop(data);
+        staging.unmap();
+        Ok(out)
+    }
+
     fn read_back_f32_bytes(&self, buf: &wgpu::Buffer, byte_len: u64) -> Result<Vec<f32>> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("glassbox/staging"),
@@ -232,6 +279,15 @@ struct LayernormDims {
     rows: u32,
     cols: u32,
     eps: f32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EmbedDims {
+    n_ids: u32,
+    dim: u32,
+    vocab: u32,
     _pad: u32,
 }
 
@@ -354,18 +410,39 @@ impl Backend for WgpuBackend {
                 got: b.shape().clone(),
             }));
         }
-        let a_cpu = self.download(a)?;
-        let b_cpu = self.download(b)?;
-        let result: Vec<f32> = a_cpu
-            .as_f32()?
-            .iter()
-            .zip(b_cpu.as_f32()?.iter())
-            .map(|(x, y)| x + y)
-            .collect();
-        let bytes: Vec<u8> = cast_slice(&result).to_vec();
-        let buf = self.upload_storage_bytes("add/out", &bytes);
-        let id = self.register(buf);
-        *out = Tensor::from_gpu(id, out.shape().clone(), out.dtype());
+
+        let pipeline = self.pipeline("add", SHADER_ADD, "add")?;
+        let a_gpu = ensure_gpu(self, a, "add/a")?;
+        let b_gpu = ensure_gpu(self, b, "add/b")?;
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "add/out")?;
+
+        let bg_layout = pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("add/bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: a_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: b_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("add/enc") });
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("add/pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let wg = (a.numel() as u32 + 255) / 256;
+            cpass.dispatch_workgroups(wg, 1, 1);
+        }
+        self.queue.submit(Some(enc.finish()));
+
+        *out = out_gpu;
         Ok(())
     }
 
@@ -596,20 +673,47 @@ impl Backend for WgpuBackend {
         check_f32(out, "embed")?;
         let dim = table.shape().dim(1)?;
         let vocab = table.shape().dim(0)?;
-        let table_cpu = self.download(table)?;
-        let table_data = table_cpu.as_f32()?;
-        let mut result = vec![0.0f32; ids.len() * dim];
-        for (i, &id) in ids.iter().enumerate() {
-            let id = id as usize;
-            if id >= vocab {
-                return Err(RuntimeError::Core(CoreError::AxisOutOfBounds { axis: id, rank: vocab }));
-            }
-            result[i * dim..(i + 1) * dim].copy_from_slice(&table_data[id * dim..(id + 1) * dim]);
+
+        let pipeline = self.pipeline("embed", SHADER_EMBED, "embed")?;
+        let dims = EmbedDims {
+            n_ids: ids.len() as u32,
+            dim: dim as u32,
+            vocab: vocab as u32,
+            _pad: 0,
+        };
+        let dims_buf = self.upload_uniform("embed/dims", &dims);
+        let table_gpu = ensure_gpu(self, table, "embed/table")?;
+        let ids_buf = Arc::new(self.upload_storage_bytes("embed/ids", cast_slice(ids)));
+        let (out_gpu, out_buf) = ensure_gpu_writable(self, out, "embed/out")?;
+
+        let bg_layout = pipeline.get_bind_group_layout(0);
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("embed/bg"),
+            layout: &bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: dims_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: table_gpu.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: ids_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out_buf.as_entire_binding() },
+            ],
+        });
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("embed/enc") });
+        {
+            let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("embed/pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&pipeline);
+            cpass.set_bind_group(0, &bind_group, &[]);
+            let wg = (ids.len() as u32 + 63) / 64;
+            cpass.dispatch_workgroups(wg, 1, 1);
         }
-        let bytes: Vec<u8> = cast_slice(&result).to_vec();
-        let buf = self.upload_storage_bytes("embed/out", &bytes);
-        let id = self.register(buf);
-        *out = Tensor::from_gpu(id, out.shape().clone(), out.dtype());
+        self.queue.submit(Some(enc.finish()));
+
+        *out = out_gpu;
         Ok(())
     }
 }
@@ -656,6 +760,17 @@ mod tests {
             return false;
         }
         a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
+    }
+
+    #[test]
+    fn download_async_roundtrips() {
+        let Some(gpu) = try_backend() else { return };
+        let data: Vec<f32> = (0..32).map(|i| i as f32 * 0.5).collect();
+        let cpu_t = Tensor::from_f32(&data, Shape::from([8, 4])).unwrap();
+        let gpu_t = gpu.upload(&cpu_t).unwrap();
+        let back = pollster::block_on(gpu.download_async(&gpu_t)).unwrap();
+        assert!(back.storage().is_cpu());
+        assert!(approx_eq(back.as_f32().unwrap(), &data, 1e-6));
     }
 
     #[test]
@@ -759,6 +874,47 @@ mod tests {
         gpu.softmax(&x_g, -1, &mut out_g).unwrap();
         let down = gpu.download(&out_g).unwrap();
         assert!(approx_eq(out_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 1e-5));
+    }
+
+    #[test]
+    fn add_kernel_matches_cpu() {
+        let Some(gpu) = try_backend() else { return };
+        let n = 137;
+        let a_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.13).sin()).collect();
+        let b_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.21).cos()).collect();
+        let a = Tensor::from_f32(&a_data, Shape::from([n])).unwrap();
+        let b = Tensor::from_f32(&b_data, Shape::from([n])).unwrap();
+
+        let mut out_cpu = Tensor::from_f32(&vec![0.0; n], Shape::from([n])).unwrap();
+        CpuBackend.add(&a, &b, &mut out_cpu).unwrap();
+
+        let a_g = gpu.upload(&a).unwrap();
+        let b_g = gpu.upload(&b).unwrap();
+        let mut out_g = gpu.alloc(Shape::from([n]), DType::F32).unwrap();
+        gpu.add(&a_g, &b_g, &mut out_g).unwrap();
+        assert!(out_g.storage().is_gpu());
+        let down = gpu.download(&out_g).unwrap();
+        assert!(approx_eq(out_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 1e-6));
+    }
+
+    #[test]
+    fn embed_kernel_matches_cpu() {
+        let Some(gpu) = try_backend() else { return };
+        let vocab = 32;
+        let dim = 8;
+        let table_data: Vec<f32> = (0..vocab * dim).map(|i| i as f32 * 0.01).collect();
+        let table = Tensor::from_f32(&table_data, Shape::from([vocab, dim])).unwrap();
+        let ids: Vec<u32> = vec![0, 5, 17, 31, 12];
+
+        let mut out_cpu = Tensor::from_f32(&vec![0.0; ids.len() * dim], Shape::from([ids.len(), dim])).unwrap();
+        CpuBackend.embed(&table, &ids, &mut out_cpu).unwrap();
+
+        let table_g = gpu.upload(&table).unwrap();
+        let mut out_g = gpu.alloc(Shape::from([ids.len(), dim]), DType::F32).unwrap();
+        gpu.embed(&table_g, &ids, &mut out_g).unwrap();
+        assert!(out_g.storage().is_gpu());
+        let down = gpu.download(&out_g).unwrap();
+        assert!(approx_eq(out_cpu.as_f32().unwrap(), down.as_f32().unwrap(), 1e-6));
     }
 
     #[test]

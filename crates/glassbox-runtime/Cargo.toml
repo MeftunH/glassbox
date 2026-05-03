@@ -22,8 +22,10 @@ rand.workspace = true
 rayon = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
+futures-channel = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 
 [features]
 default = ["cpu"]
 cpu = ["dep:rayon"]
-wgpu = ["dep:wgpu", "dep:pollster"]
+wgpu = ["dep:wgpu", "dep:pollster", "dep:futures-channel", "dep:futures-util"]
