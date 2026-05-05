@@ -97,12 +97,16 @@
             ];
             for (const s of subscriptions) session.handle.subscribe(s);
 
-            const result = session.handle.generate(session.prompt, session.maxNewTokens, {
+            const args = {
                 temperature: session.temperature,
                 top_k: session.topK,
                 top_p: session.topP,
                 seed: 42,
-            });
+            };
+            const result =
+                session.activeBackend === 'webgpu'
+                    ? await session.handle.generateAsync(session.prompt, session.maxNewTokens, args)
+                    : session.handle.generate(session.prompt, session.maxNewTokens, args);
             session.generated = Array.from(result.tokens);
             session.generatedText = result.text;
             session.elapsedMs = result.elapsed_ms;

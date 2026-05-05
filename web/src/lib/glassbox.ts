@@ -52,6 +52,7 @@ export interface GlassboxHandle {
     clearHooks(): void;
     forward(ids: Uint32Array): Float32Array;
     generate(prompt: string, maxNew: number, args: SamplingArgs): GenerateOutput;
+    generateAsync(prompt: string, maxNew: number, args: SamplingArgs): Promise<GenerateOutput>;
     runPathPatch(args: PathPatchArgs): PathPatchOut;
     loadSae(
         key: string,

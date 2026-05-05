@@ -24,9 +24,12 @@
 - Async runner: `Gpt2RunnerAsync` and `AsyncBackend` trait (with `download_async`) so the browser path can `await` GPU readbacks instead of blocking the JS event loop. The wasm surface gains `Glassbox.generateAsync(prompt, max_new, args)` returning a `Promise<GenerateOutput>`.
 - End-to-end validation against real GPT-2: a `cargo run --release --example cli_generate` example now loads `models/gpt2-small.glx` (124M params, 477 MB) and produces coherent English continuations through the Rust forward pass on the CPU backend.
 - BPE byte-encoding fix in `glassbox-models::tokenizer`: spaces and newlines now byte-encode to `Ġ`/`Ċ` during pretokenisation so HF GPT-2 vocab merges resolve correctly. Encode/decode round-trip is regression-tested.
+- Browser path now uses `Glassbox.generateAsync` automatically when the active backend is WebGPU; the CPU backend keeps the sync `generate` call. The TS `GlassboxHandle` interface declares `generateAsync(prompt, maxNew, args): Promise<GenerateOutput>` alongside the existing sync method.
+- `web/static/models/gpt2-small.glx` is symlinked to the repo's `models/` copy so the dev server can load the real 124M weights without an upload step.
+- perf-notes refreshed with real CPU-backend measurements on i7-9750H + GPT-2 small (single-token forward, generation throughput across prompt and `max_new` lengths). The placeholder per-stage breakdown is gone; the open-work list now leads with the missing KV cache.
 - ARCHITECTURE.md, perf-notes, GPT-2 hook reference.
 
 ### Known limitations
 
-- The runner's helpers (`split_qkv`, `reshape_to_heads`, `merge_heads`, `add_row_bias`) operate on CPU tensors and currently call the sync `Backend::download` to reach them. Native WebGPU works end-to-end; in the browser those sync downloads would block the JS event loop, so the browser path defaults to the CPU backend. Promoting the runner to async (using `WgpuBackend::download_async`, which is already in place) is what unlocks browser-WebGPU generate.
-- SAE feature discovery is wired in the wasm bindings but the corresponding UI panel is not yet built; users can drive it from the browser console via the `Glassbox` handle.
+- No KV cache yet: forward pass recomputes the full sequence on every step, so per-token wall time grows with sequence length (see perf-notes for the curve). This is the next CPU-backend leverage point.
+- Browser-WebGPU generation works through the new async runner (`generateAsync` + `Gpt2RunnerAsync`), but the runner's helpers (`split_qkv`, `reshape_to_heads`, `merge_heads`, `add_row_bias`) still round-trip via `download_async` per layer. Correct, but every layer pays one GPU-readback's worth of latency; promoting these helpers to GPU kernels is what unlocks the GPU's actual throughput.
